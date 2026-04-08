@@ -601,6 +601,35 @@ def set_client_config(domain: str, key: str, value: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
+def set_context_setting(domain: str, context: str, key: str, value: str) -> Dict[str, Any]:
+    """
+    Update a context setting in the MODX database (modx_context_setting).
+    The setting must already exist.
+    """
+    safe_context = context.replace("'", "\\'")
+    safe_key = key.replace("'", "\\'")
+    safe_value = value.replace("'", "\\'")
+
+    sql = f"UPDATE modx_context_setting SET value='{safe_value}' WHERE context_key='{safe_context}' AND `key`='{safe_key}';"
+
+    result = mysql_exec(domain, sql)
+
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("stderr") or result.get("error", "MySQL error")}
+
+    check_sql = f"SELECT `key`, value FROM modx_context_setting WHERE context_key='{safe_context}' AND `key`='{safe_key}';"
+    check = mysql_exec(domain, check_sql)
+
+    return {
+        "ok": True,
+        "context": context,
+        "key": key,
+        "value": value,
+        "current": check.get("stdout", "").strip() if check.get("ok") else None,
+    }
+
+
+@mcp.tool()
 def get_client_config(domain: str, key: str) -> Dict[str, Any]:
     """
     Read a ClientConfig setting (cgSetting) from the MODX database.
