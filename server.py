@@ -175,6 +175,13 @@ def ensure_backup(domain: str, path: str) -> Dict[str, Any]:
         _backups_cache.add(cache_key)
         return {"ok": True, "backup_created": False, "reason": "backup_already_exists"}
 
+    # Check if file exists before creating backup
+    file_exists = ssh_exec(domain, f"test -f '{full_path}' && echo 'exists'")
+    if "exists" not in file_exists.get("stdout", ""):
+        # File doesn't exist yet, no backup needed
+        _backups_cache.add(cache_key)
+        return {"ok": True, "backup_created": False, "reason": "file_does_not_exist"}
+
     # Create backup
     result = ssh_exec(domain, f"cp '{full_path}' '{backup_path}'")
 
@@ -551,6 +558,29 @@ VALUES
         "static_file": static_file,
         "category": category,
         "message": f"Chunk '{name}' created successfully",
+    }
+
+
+@mcp.tool()
+def update_chunk_file(domain: str, name: str, static_file: str) -> Dict[str, Any]:
+    """
+    Update the static_file path of an existing chunk in MODX database.
+    """
+    safe_name = name.replace("'", "\\'")
+    safe_file = static_file.replace("'", "\\'")
+
+    sql = f"UPDATE modx_site_htmlsnippets SET static_file='{safe_file}' WHERE name='{safe_name}';"
+
+    result = mysql_exec(domain, sql)
+
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("stderr") or result.get("error", "MySQL error")}
+
+    return {
+        "ok": True,
+        "name": name,
+        "static_file": static_file,
+        "message": f"Chunk '{name}' file path updated successfully",
     }
 
 
