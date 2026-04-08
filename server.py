@@ -502,6 +502,58 @@ def download_fonts(domain: str, url: str) -> Dict[str, Any]:
     }
 
 
+# ============ Chunk tools ============
+
+@mcp.tool()
+def create_chunk(domain: str, name: str, description: str, static_file: str, category: int) -> Dict[str, Any]:
+    """
+    Create a file-based chunk in MODX database.
+
+    Args:
+        domain: Site domain
+        name: Chunk name (e.g., 'blocks-card')
+        description: Chunk description (e.g., 'Card')
+        static_file: Path relative to webroot (e.g., 'core/elements/contentblocks/fields/blocks-card.tpl')
+        category: Category ID (e.g., 55 for Repeater)
+
+    Returns: chunk ID if created, or error if already exists
+    """
+    safe_name = name.replace("'", "\\'")
+    safe_description = description.replace("'", "\\'")
+    safe_file = static_file.replace("'", "\\'")
+
+    # Check if chunk already exists
+    check_sql = f"SELECT id FROM modx_site_htmlsnippets WHERE name='{safe_name}';"
+    check = mysql_exec(domain, check_sql)
+
+    if check.get("ok") and check.get("stdout", "").strip():
+        return {
+            "ok": False,
+            "error": f"Chunk '{name}' already exists",
+        }
+
+    sql = f"""
+INSERT INTO modx_site_htmlsnippets
+  (source, name, description, snippet, static, static_file, category, locked, property_preprocess)
+VALUES
+  (1, '{safe_name}', '{safe_description}', '', 1, '{safe_file}', {category}, 0, 0);
+"""
+
+    result = mysql_exec(domain, sql)
+
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("stderr") or result.get("error", "MySQL error")}
+
+    return {
+        "ok": True,
+        "name": name,
+        "description": description,
+        "static_file": static_file,
+        "category": category,
+        "message": f"Chunk '{name}' created successfully",
+    }
+
+
 # ============ ClientConfig tools ============
 
 def mysql_exec(domain: str, sql: str) -> Dict[str, Any]:
