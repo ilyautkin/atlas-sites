@@ -561,29 +561,6 @@ VALUES
     }
 
 
-@mcp.tool()
-def update_chunk_file(domain: str, name: str, static_file: str) -> Dict[str, Any]:
-    """
-    Update the static_file path of an existing chunk in MODX database.
-    """
-    safe_name = name.replace("'", "\\'")
-    safe_file = static_file.replace("'", "\\'")
-
-    sql = f"UPDATE modx_site_htmlsnippets SET static_file='{safe_file}' WHERE name='{safe_name}';"
-
-    result = mysql_exec(domain, sql)
-
-    if not result.get("ok"):
-        return {"ok": False, "error": result.get("stderr") or result.get("error", "MySQL error")}
-
-    return {
-        "ok": True,
-        "name": name,
-        "static_file": static_file,
-        "message": f"Chunk '{name}' file path updated successfully",
-    }
-
-
 # ============ ClientConfig tools ============
 
 def mysql_exec(domain: str, sql: str) -> Dict[str, Any]:
