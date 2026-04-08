@@ -466,6 +466,42 @@ def deploy_folder(domain: str, local_path: str, remote_path: str) -> Dict[str, A
         client.close()
 
 
+# ============ Console script tools ============
+
+@mcp.tool()
+def download_fonts(domain: str, url: str) -> Dict[str, Any]:
+    """
+    Download Google Fonts to local assets/fonts/ on the site server.
+    Runs storage/core/components/console/files/global/downloadfonts.php via CLI.
+    Returns the CSS filename and the <script> tag to insert in head.tpl.
+    """
+    script_path = f"{HTTPDOCS_PATH}/core/components/console/files/global/downloadfonts.php"
+    result = ssh_exec(domain, f"php {script_path} {url!r}")
+
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("stderr") or result.get("error", "Script error")}
+
+    output = result.get("stdout", "")
+
+    # Parse output: first line is "OK:<cssFileName>", second is the <script> tag
+    lines = [l for l in output.strip().splitlines() if l.strip()]
+    css_file = None
+    script_tag = None
+
+    for line in lines:
+        if line.startswith("OK:"):
+            css_file = line[3:].strip()
+        elif "<script" in line:
+            script_tag = line.strip()
+
+    return {
+        "ok": True,
+        "css_file": css_file,
+        "script_tag": script_tag,
+        "raw_output": output.strip(),
+    }
+
+
 # ============ ClientConfig tools ============
 
 def mysql_exec(domain: str, sql: str) -> Dict[str, Any]:
