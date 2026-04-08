@@ -469,7 +469,7 @@ def deploy_folder(domain: str, local_path: str, remote_path: str) -> Dict[str, A
 # ============ ClientConfig tools ============
 
 def mysql_exec(domain: str, sql: str) -> Dict[str, Any]:
-    """Execute a MySQL query using DB credentials from Atlas."""
+    """Execute a MySQL query using DB credentials from Atlas. SQL is passed via stdin to avoid shell quoting issues."""
     creds = get_site_credentials(domain)
     if not creds.get("ok"):
         return creds
@@ -482,10 +482,59 @@ def mysql_exec(domain: str, sql: str) -> Dict[str, Any]:
     if not dbname or not dbuser:
         return {"ok": False, "error": "DB credentials (dbname/dbuser) not set in Atlas for this site."}
 
-    pass_arg = f"-p{dbpass}" if dbpass else ""
-    command = f"mysql -h 127.0.0.1 -u {dbuser} {pass_arg} {dbname} -e \"{sql}\""
+    client, error = get_ssh_connection(domain)
+    if error:
+        return error
 
-    return ssh_exec(domain, command)
+    try:
+        pass_arg = f"-p{dbpass}" if dbpass else ""
+        command = f"mysql -h 127.0.0.1 -u {dbuser} {pass_arg} {dbname}"
+        stdin, stdout, stderr = client.exec_command(command, timeout=30)
+        stdin.write(sql.encode("utf-8"))
+        stdin.channel.shutdown_write()
+
+        exit_code = stdout.channel.recv_exit_status()
+        output = stdout.read().decode("utf-8", errors="replace")
+        err_output = stderr.read().decode("utf-8", errors="replace")
+
+        return {
+            "ok": exit_code == 0,
+            "exit_code": exit_code,
+            "stdout": output,
+            "stderr": err_output,
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"MySQL execution failed: {str(e)}"}
+    finally:
+        client.close()
+
+
+@mcp.tool()
+def set_client_config_bulk(domain: str, settings: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Update multiple ClientConfig settings in one MySQL call.
+    settings is a dict of {key: value} pairs.
+    """
+    if not settings:
+        return {"ok": False, "error": "settings dict is empty"}
+
+    statements = []
+    for key, value in settings.items():
+        safe_key = key.replace("'", "\\'")
+        safe_value = value.replace("'", "\\'")
+        statements.append(f"UPDATE modx_clientconfig_setting SET value='{safe_value}' WHERE `key`='{safe_key}';")
+
+    sql = " ".join(statements)
+    result = mysql_exec(domain, sql)
+
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("stderr") or result.get("error", "MySQL error")}
+
+    return {
+        "ok": True,
+        "updated": list(settings.keys()),
+        "count": len(settings),
+    }
 
 
 @mcp.tool()
@@ -497,14 +546,14 @@ def set_client_config(domain: str, key: str, value: str) -> Dict[str, Any]:
     safe_value = value.replace("'", "\\'")
     safe_key = key.replace("'", "\\'")
 
-    sql = f"UPDATE modx_cgSetting SET value='{safe_value}' WHERE \\`key\\`='{safe_key}';"
+    sql = f"UPDATE modx_clientconfig_setting SET value='{safe_value}' WHERE `key`='{safe_key}';"
 
     result = mysql_exec(domain, sql)
 
     if not result.get("ok"):
         return {"ok": False, "error": result.get("stderr") or result.get("error", "MySQL error")}
 
-    check_sql = f"SELECT \\`key\\`, value FROM modx_cgSetting WHERE \\`key\\`='{safe_key}';"
+    check_sql = f"SELECT `key`, value FROM modx_clientconfig_setting WHERE `key`='{safe_key}';"
     check = mysql_exec(domain, check_sql)
 
     return {
@@ -525,10 +574,10 @@ def get_client_config(domain: str, key: str) -> Dict[str, Any]:
     table = f"{prefix}cgSetting"
 
     if key == "*":
-        sql = "SELECT \\`key\\`, value FROM modx_cgSetting;"
+        sql = "SELECT `key`, value FROM modx_clientconfig_setting;"
     else:
         safe_key = key.replace("'", "\\'")
-        sql = f"SELECT \\`key\\`, value FROM modx_cgSetting WHERE \\`key\\`='{safe_key}';"
+        sql = f"SELECT `key`, value FROM modx_clientconfig_setting WHERE `key`='{safe_key}';"
 
     result = mysql_exec(domain, sql)
 
