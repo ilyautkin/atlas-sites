@@ -152,6 +152,30 @@ def ssh_exec(domain: str, command: str) -> Dict[str, Any]:
         client.close()
 
 
+def ssh_exec_stdin(domain: str, command: str, stdin_data: str, timeout: int = 60) -> Dict[str, Any]:
+    """Execute command via SSH passing data to stdin."""
+    client, error = get_ssh_connection(domain)
+    if error:
+        return error
+    try:
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        stdin.write(stdin_data.encode("utf-8"))
+        stdin.channel.shutdown_write()
+        exit_code = stdout.channel.recv_exit_status()
+        output = stdout.read().decode("utf-8", errors="replace")
+        err_output = stderr.read().decode("utf-8", errors="replace")
+        return {
+            "ok": exit_code == 0,
+            "exit_code": exit_code,
+            "stdout": output,
+            "stderr": err_output,
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"Command execution failed: {str(e)}"}
+    finally:
+        client.close()
+
+
 def ensure_backup(domain: str, path: str) -> Dict[str, Any]:
     """
     Ensure a backup exists for the file. Creates one if needed.
@@ -507,6 +531,57 @@ def download_fonts(domain: str, url: str) -> Dict[str, Any]:
         "script_tag": script_tag,
         "raw_output": output.strip(),
     }
+
+
+# ============ Content filling tools ============
+
+@mcp.tool()
+def fill_site_content(domain: str, resource_id: int, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Fill ContentBlocks content for a MODX resource.
+
+    Claude passes structured data only (resource_id + rows JSON schema).
+    The PHP runner on the server converts this to SiteContent method calls —
+    no arbitrary PHP is executed by Claude.
+
+    Requires the theme to be installed (installer deploys the PHP runner to
+    core/components/site/console/fillcontent.php).
+
+    Args:
+        domain:      Site domain (e.g. 'example.nl')
+        resource_id: MODX resource ID to fill (homepage = 1)
+        rows:        Content rows. See fill_site_content JSON schema in CLAUDE.md.
+
+    Returns: {"ok": true, "message": "Klaar. Resource #1 bijgewerkt."}
+    """
+    script_path = f"{HTTPDOCS_PATH}/core/components/site/console/fillcontent.php"
+
+    check = ssh_exec(domain, f"test -f '{script_path}' && echo 'exists'")
+    if "exists" not in check.get("stdout", ""):
+        return {
+            "ok": False,
+            "error": (
+                "PHP runner not found. Run the theme installer first: "
+                "php core/vendor/heibel/theme/bin/installer install"
+            ),
+        }
+
+    payload = json.dumps({"resource_id": resource_id, "rows": rows}, ensure_ascii=False)
+
+    result = ssh_exec_stdin(domain, f"php '{script_path}'", payload, timeout=60)
+
+    if not result.get("ok"):
+        error = result.get("stderr", "").strip() or result.get("error", "Script failed")
+        return {"ok": False, "error": error, "stdout": result.get("stdout", "").strip()}
+
+    output = result.get("stdout", "").strip()
+    if not output:
+        return {"ok": False, "error": "No output from PHP runner", "stderr": result.get("stderr", "")}
+
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError:
+        return {"ok": True, "message": output}
 
 
 # ============ Chunk tools ============

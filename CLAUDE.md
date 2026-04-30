@@ -79,10 +79,169 @@ $hover-colors: (
 | `clear_cache(domain)` | домен | Очистить MODX кэш (core/cache/) |
 | `delete_backups(domain)` | домен | Удалить .backup файлы созданные в сессии |
 
+### Заполнение контента (ContentBlocks)
+
+| Команда | Параметры | Описание |
+|---------|-----------|----------|
+| `fill_site_content(domain, resource_id, rows)` | домен, ID ресурса, массив строк | Заполнить ContentBlocks контент ресурса |
+
+Требует установленной темы (installer деплоит PHP runner автоматически).
+
 ### Примечания к путям
 
 - Все пути указываются **относительно `httpdocs/`**
 - Примеры: `assets/scss/style.scss`, `assets/scss/settings/_variables.scss`
+
+## fill_site_content — JSON-схема
+
+### Структура вызова
+
+```python
+fill_site_content(
+    domain="example.nl",
+    resource_id=1,          # homepage всегда 1
+    rows=[...],             # массив строк (секций) страницы
+)
+```
+
+### Строка (row)
+
+```json
+{
+  "id": "r1",
+  "layout": 1,
+  "settings": {"paddingTop": "pt-0", "paddingBottom": "pb-0"},
+  "columns": {
+    "column": [ ]
+  }
+}
+```
+
+| layout ID | column refs |
+|-----------|-------------|
+| 1 (full-width) | `column` |
+| 2 (one-column) | `one_column` |
+| 3 (narrow-column) | `narrow_column` |
+| 4 (two-columns 50/50) | `left`, `right` |
+| 5 (two-columns 33/66) | `left`, `right` |
+| 6 (two-columns 66/33) | `left`, `right` |
+| 7 (three-columns) | `left`, `center`, `right` |
+
+settings: `appearance` (bg-light/bg-dark/…), `paddingTop` (pt-0/pt-5/…), `paddingBottom`, `justify` (align-items-center/…), `classes`
+
+### Типы полей (fields)
+
+**title** (field 100)
+```json
+{"type": "title", "id": "f1", "value": "Heading", "settings": {"alignment": "text-center"}}
+```
+
+**richtext** (field 200)
+```json
+{"type": "richtext", "id": "f2", "value": "<p>HTML.</p>"}
+```
+
+**image** (field 300)
+```json
+{"type": "image", "id": "f3", "path": "/uploads/afbeelding/website-test.jpg", "alt": "Alt"}
+```
+
+**simple** — для одиночных полей: googlemap (1200), formalicious (700), partners (800), reviews (1600), gallery (600), resources (1000)
+```json
+{"type": "simple", "id": "f4", "field": 700, "value": "1"}
+```
+partners и reviews: `"value": "all"` ; formalicious/googlemap: `"value": "1"`
+
+**buttons** — standalone кнопки (btn-container, field 400)
+```json
+{
+  "type": "buttons", "id": "f5",
+  "settings": {"alignment": "justify-content-center"},
+  "buttons": [
+    {"link": "/contact", "text": "Contact", "appearance": "btn-primary", "target": "_self"}
+  ]
+}
+```
+
+**repfield** — repeater (hero-slider 500, blocks 1100, faq 900, usp 1300)
+```json
+{"type": "repfield", "id": "f6", "field": 500, "settings": {}, "rows": [...]}
+```
+
+### Строки repeater по field ID
+
+**hero-slider (500)**
+```json
+{
+  "image": {"path": "/uploads/afbeelding/website-test.jpg", "alt": "", "container": "1920"},
+  "title": {"value": "Hero title", "level": "h1", "alignment": "text-start"},
+  "richtext": "<p>Subtext.</p>",
+  "buttons": {"alignment": "justify-content-start", "items": [
+    {"link": "/contact", "text": "CTA", "appearance": "btn-primary"}
+  ]}
+}
+```
+
+**blocks (1100)**
+```json
+{
+  "image": {"path": "/uploads/afbeelding/website-test.jpg", "alt": "", "container": "420"},
+  "title": {"value": "Card title"},
+  "richtext": "<p>Card text.</p>",
+  "buttons": {"items": [{"link": "/dienst", "text": "Meer info", "appearance": "btn-outline-primary"}]}
+}
+```
+
+**faq (900)**
+```json
+{
+  "title": {"value": "Vraag?"},
+  "richtext": "<p>Antwoord.</p>"
+}
+```
+
+**usp (1300)**
+```json
+{
+  "image": {"path": "/uploads/afbeelding/website-test.jpg", "alt": "icon", "container": "80"},
+  "text": "USP tekst",
+  "link": "/diensten"
+}
+```
+
+### Полный пример вызова
+
+```python
+fill_site_content("example.nl", 1, [
+    # Hero — full-width, без отступов
+    {
+        "id": "r1", "layout": 1,
+        "settings": {"paddingTop": "pt-0", "paddingBottom": "pb-0"},
+        "columns": {"column": [
+            {"type": "repfield", "id": "f1", "field": 500, "rows": [{
+                "image": {"path": "/uploads/afbeelding/website-test.jpg", "alt": "", "container": "1920"},
+                "title": {"value": "Welkom bij ons", "level": "h1"},
+                "richtext": "<p>Korte introductie.</p>",
+                "buttons": {"items": [{"link": "/contact", "text": "Neem contact op", "appearance": "btn-primary"}]}
+            }]}
+        ]}
+    },
+    # Tekst + foto — two-columns 50/50
+    {
+        "id": "r2", "layout": 4,
+        "settings": {"justify": "align-items-center"},
+        "columns": {
+            "left": [
+                {"type": "title", "id": "f2", "value": "Over ons"},
+                {"type": "richtext", "id": "f3", "value": "<p>Introductietekst.</p>"}
+            ],
+            "right": [
+                {"type": "image", "id": "f4", "path": "/uploads/afbeelding/website-test.jpg", "alt": "Over ons"}
+            ]
+        }
+    }
+])
+```
 
 ## SSH подключение (внутренняя логика)
 
