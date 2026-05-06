@@ -178,42 +178,47 @@ def ssh_exec_stdin(domain: str, command: str, stdin_data: str, timeout: int = 60
 
 def ensure_backup(domain: str, path: str) -> Dict[str, Any]:
     """
-    Ensure a backup exists for the file. Creates one if needed.
-    Returns info about backup status.
+    Ensure a fresh backup exists for the file.
+    - No backup → create one (if file exists).
+    - Backup from today → keep it.
+    - Backup from yesterday or older → replace with a fresh copy.
     """
     cache_key = f"{domain.lower()}:{path}"
 
-    # If we already handled backup in this session, skip
     if cache_key in _backups_cache:
         return {"ok": True, "backup_created": False, "reason": "already_handled_this_session"}
 
     full_path = f"{HTTPDOCS_PATH}/{path.lstrip('/')}"
     backup_path = f"{full_path}.backup"
 
-    # Check if backup already exists on server
-    check_result = ssh_exec(domain, f"test -f '{backup_path}' && echo 'exists'")
-    backup_exists = "exists" in check_result.get("stdout", "")
+    check_result = ssh_exec(domain,
+        f"if [ -f '{backup_path}' ]; then "
+        f"  stat -c '%y' '{backup_path}' | grep -q \"$(date +%Y-%m-%d)\" && echo 'backup_today' || echo 'backup_old'; "
+        f"elif [ -f '{full_path}' ]; then "
+        f"  echo 'no_backup_file_exists'; "
+        f"else "
+        f"  echo 'no_backup_no_file'; "
+        f"fi"
+    )
+    status = check_result.get("stdout", "").strip()
 
-    if backup_exists:
-        # Backup exists from previous session, don't overwrite
+    if status == "backup_today":
         _backups_cache.add(cache_key)
-        return {"ok": True, "backup_created": False, "reason": "backup_already_exists"}
+        return {"ok": True, "backup_created": False, "reason": "backup_is_fresh"}
 
-    # Check if file exists before creating backup
-    file_exists = ssh_exec(domain, f"test -f '{full_path}' && echo 'exists'")
-    if "exists" not in file_exists.get("stdout", ""):
-        # File doesn't exist yet, no backup needed
+    if status == "no_backup_no_file":
         _backups_cache.add(cache_key)
         return {"ok": True, "backup_created": False, "reason": "file_does_not_exist"}
 
-    # Create backup
-    result = ssh_exec(domain, f"cp '{full_path}' '{backup_path}'")
+    if status == "backup_old":
+        ssh_exec(domain, f"rm -f '{backup_path}'")
 
+    result = ssh_exec(domain, f"cp '{full_path}' '{backup_path}'")
     if not result.get("ok"):
         return {"ok": False, "error": f"Failed to create backup: {result.get('stderr', result.get('error', 'Unknown error'))}"}
 
     _backups_cache.add(cache_key)
-    return {"ok": True, "backup_created": True, "backup_path": f"{path}.backup"}
+    return {"ok": True, "backup_created": True, "backup_path": f"{path}.backup", "replaced_stale": status == "backup_old"}
 
 
 # ============ Original tools ============
@@ -348,6 +353,21 @@ def list_files(domain: str, path: str, pattern: str = "*") -> Dict[str, Any]:
 
 
 @mcp.tool()
+def create_directory(domain: str, path: str) -> Dict[str, Any]:
+    """
+    Create a directory (and all parent directories) on the site server.
+    Path is relative to httpdocs/.
+    """
+    full_path = f"{HTTPDOCS_PATH}/{path.lstrip('/')}"
+    result = ssh_exec(domain, f"mkdir -p '{full_path}' && echo 'created'")
+
+    if not result.get("ok") or "created" not in result.get("stdout", ""):
+        return {"ok": False, "error": f"Failed to create directory: {result.get('stderr', result.get('error', 'Unknown error'))}"}
+
+    return {"ok": True, "path": path, "message": "Directory created successfully"}
+
+
+@mcp.tool()
 def clear_cache(domain: str) -> Dict[str, Any]:
     """
     Clear MODX cache by removing contents of:
@@ -414,6 +434,7 @@ def deploy_folder(domain: str, local_path: str, remote_path: str) -> Dict[str, A
     """
     Deploy a local folder to the site server via tar stream over SSH.
     The folder is compressed locally and extracted on the remote side in one operation.
+    Before deploying, creates a .backup.tar.gz of the existing remote folder (if present and not already backed up).
 
     Args:
         domain: Site domain (Atlas will resolve SSH credentials).
@@ -436,7 +457,6 @@ def deploy_folder(domain: str, local_path: str, remote_path: str) -> Dict[str, A
     try:
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             for dirpath, dirnames, filenames in os.walk(local_path):
-                # Skip .git, __pycache__, .venv in-place
                 dirnames[:] = [
                     d for d in dirnames
                     if d not in {".git", "__pycache__", ".venv", "node_modules"}
@@ -463,10 +483,39 @@ def deploy_folder(domain: str, local_path: str, remote_path: str) -> Dict[str, A
 
     try:
         remote_path = remote_path.rstrip("/")
+        folder_dest = f"{remote_path}/{folder_name}"
+        backup_tar = f"{folder_dest}.backup.tar.gz"
+
+        # Backup remote folder: skip if today's backup exists, replace if stale
+        backup_created = False
+        check_stdin, check_stdout, check_stderr = client.exec_command(
+            f"if [ ! -d '{folder_dest}' ]; then echo 'no_folder'; "
+            f"elif [ -f '{backup_tar}' ]; then "
+            f"  stat -c '%y' '{backup_tar}' | grep -q \"$(date +%Y-%m-%d)\" && echo 'backup_today' || echo 'backup_old'; "
+            f"else echo 'no_backup'; fi",
+            timeout=30
+        )
+        check_out = check_stdout.read().decode("utf-8", errors="replace").strip()
+        check_stdout.channel.recv_exit_status()
+
+        if check_out in ("no_backup", "backup_old"):
+            if check_out == "backup_old":
+                client.exec_command(f"rm -f '{backup_tar}'", timeout=30)[1].channel.recv_exit_status()
+            bk_stdin, bk_stdout, bk_stderr = client.exec_command(
+                f"tar -czf '{backup_tar}' -C '{remote_path}' '{folder_name}/'",
+                timeout=120
+            )
+            bk_exit = bk_stdout.channel.recv_exit_status()
+            if bk_exit != 0:
+                bk_err = bk_stderr.read().decode("utf-8", errors="replace")
+                return {"ok": False, "error": f"Failed to create folder backup: {bk_err}"}
+            backup_created = True
+
+        # Deploy
         cmd = (
             f"mkdir -p '{remote_path}' && "
             f"tar -xzf - -C '{remote_path}' && "
-            f"find '{remote_path}/{folder_name}' -name '._*' -type f -delete"
+            f"find '{folder_dest}' -name '._*' -type f -delete"
         )
         stdin, stdout, stderr = client.exec_command(cmd, timeout=120)
         stdin.write(buf.read())
@@ -484,15 +533,75 @@ def deploy_folder(domain: str, local_path: str, remote_path: str) -> Dict[str, A
                 "stdout": out,
             }
 
+        response = {
+            "ok": True,
+            "folder": folder_name,
+            "remote_path": folder_dest,
+            "archive_bytes": archive_size,
+            "message": f"Deployed {folder_name} to {folder_dest}",
+        }
+        if backup_created:
+            response["backup_created"] = True
+            response["backup_path"] = backup_tar
+
+        return response
+    except Exception as e:
+        return {"ok": False, "error": f"Deployment failed: {str(e)}"}
+    finally:
+        client.close()
+
+
+@mcp.tool()
+def sync_folder(domain: str, remote_path: str, local_path: str) -> Dict[str, Any]:
+    """
+    Download a folder from the site server to local machine via tar stream over SSH.
+    The folder itself is placed inside local_path, so:
+        remote_path=httpdocs/core/components/commerce + local_path=/tmp
+        → /tmp/commerce/
+
+    Args:
+        domain: Site domain (Atlas will resolve SSH credentials).
+        remote_path: Source path on server relative to user home (e.g. 'httpdocs/core/components/commerce').
+        local_path: Absolute local path where the folder will be extracted.
+    """
+    remote_path = remote_path.rstrip("/")
+    folder_name = os.path.basename(remote_path)
+    parent_path = os.path.dirname(remote_path)
+
+    local_path = os.path.abspath(local_path)
+    os.makedirs(local_path, exist_ok=True)
+
+    client, error = get_ssh_connection(domain)
+    if error:
+        return error
+
+    try:
+        stdin, stdout, stderr = client.exec_command(
+            f"tar -czf - -C '{parent_path}' '{folder_name}/'",
+            timeout=120
+        )
+        stdin.channel.shutdown_write()
+
+        tar_data = stdout.read()
+        exit_code = stdout.channel.recv_exit_status()
+        err = stderr.read().decode("utf-8", errors="replace")
+
+        if exit_code != 0:
+            return {"ok": False, "error": f"Remote tar failed (exit {exit_code})", "stderr": err}
+
+        buf = io.BytesIO(tar_data)
+        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            tar.extractall(path=local_path)
+
         return {
             "ok": True,
             "folder": folder_name,
-            "remote_path": f"{remote_path}/{folder_name}",
-            "archive_bytes": archive_size,
-            "message": f"Deployed {folder_name} to {remote_path}/{folder_name}",
+            "local_path": os.path.join(local_path, folder_name),
+            "bytes_downloaded": len(tar_data),
+            "message": f"Synced {folder_name} to {os.path.join(local_path, folder_name)}",
         }
     except Exception as e:
-        return {"ok": False, "error": f"Deployment failed: {str(e)}"}
+        return {"ok": False, "error": f"Sync failed: {str(e)}"}
     finally:
         client.close()
 
