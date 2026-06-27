@@ -176,6 +176,16 @@ def ssh_exec_stdin(domain: str, command: str, stdin_data: str, timeout: int = 60
         client.close()
 
 
+def _backup_path(full_path: str) -> str:
+    """
+    Backup path for a file: same directory, basename prefixed with 'atlbkp-'
+    and suffixed '.backup'. The prefix makes all backups easy to find/delete later
+    (e.g. find / -name 'atlbkp-*').
+    """
+    directory, base = os.path.split(full_path)
+    return f"{directory}/atlbkp-{base}.backup" if directory else f"atlbkp-{base}.backup"
+
+
 def ensure_backup(domain: str, path: str) -> Dict[str, Any]:
     """
     Ensure a fresh backup exists for the file.
@@ -189,7 +199,7 @@ def ensure_backup(domain: str, path: str) -> Dict[str, Any]:
         return {"ok": True, "backup_created": False, "reason": "already_handled_this_session"}
 
     full_path = f"{HTTPDOCS_PATH}/{path.lstrip('/')}"
-    backup_path = f"{full_path}.backup"
+    backup_path = _backup_path(full_path)
 
     check_result = ssh_exec(domain,
         f"if [ -f '{backup_path}' ]; then "
@@ -218,7 +228,7 @@ def ensure_backup(domain: str, path: str) -> Dict[str, Any]:
         return {"ok": False, "error": f"Failed to create backup: {result.get('stderr', result.get('error', 'Unknown error'))}"}
 
     _backups_cache.add(cache_key)
-    return {"ok": True, "backup_created": True, "backup_path": f"{path}.backup", "replaced_stale": status == "backup_old"}
+    return {"ok": True, "backup_created": True, "backup_path": _backup_path(path), "replaced_stale": status == "backup_old"}
 
 
 # ============ Original tools ============
@@ -293,7 +303,7 @@ def write_file(domain: str, path: str, content: str) -> Dict[str, Any]:
     """
     Write content to a file on the site server.
     Path is relative to httpdocs/ (e.g., 'assets/scss/style.scss').
-    Automatically creates a .backup before first write in session.
+    Automatically creates an 'atlbkp-<name>.backup' before first write in session.
     """
     # Ensure backup exists before writing
     backup_result = ensure_backup(domain, path)
@@ -407,15 +417,15 @@ def delete_backups(domain: str) -> Dict[str, Any]:
     for cache_key in domain_backups:
         # Extract path from cache key (format: "domain:path")
         path = cache_key.split(":", 1)[1]
-        backup_path = f"{HTTPDOCS_PATH}/{path.lstrip('/')}.backup"
+        backup_path = _backup_path(f"{HTTPDOCS_PATH}/{path.lstrip('/')}")
 
         result = ssh_exec(domain, f"rm -f '{backup_path}'")
 
         if result.get("ok") or result.get("exit_code") == 0:
-            deleted.append(f"{path}.backup")
+            deleted.append(_backup_path(path))
             _backups_cache.discard(cache_key)
         else:
-            errors.append(f"{path}.backup: {result.get('stderr', 'Unknown error')}")
+            errors.append(f"{_backup_path(path)}: {result.get('stderr', 'Unknown error')}")
 
     response = {
         "ok": len(errors) == 0,
@@ -434,7 +444,7 @@ def deploy_folder(domain: str, local_path: str, remote_path: str) -> Dict[str, A
     """
     Deploy a local folder to the site server via tar stream over SSH.
     The folder is compressed locally and extracted on the remote side in one operation.
-    Before deploying, creates a .backup.tar.gz of the existing remote folder (if present and not already backed up).
+    Before deploying, creates an 'atlbkp-<folder>.backup.tar.gz' of the existing remote folder (if present and not already backed up).
 
     Args:
         domain: Site domain (Atlas will resolve SSH credentials).
@@ -484,7 +494,7 @@ def deploy_folder(domain: str, local_path: str, remote_path: str) -> Dict[str, A
     try:
         remote_path = remote_path.rstrip("/")
         folder_dest = f"{remote_path}/{folder_name}"
-        backup_tar = f"{folder_dest}.backup.tar.gz"
+        backup_tar = f"{remote_path}/atlbkp-{folder_name}.backup.tar.gz"
 
         # Backup remote folder: skip if today's backup exists, replace if stale
         backup_created = False
@@ -743,6 +753,98 @@ VALUES
         "category": category,
         "message": f"Chunk '{name}' created successfully",
     }
+
+
+def _sql_escape(value: str) -> str:
+    """Escape a string for embedding in a single-quoted MySQL literal (backslash first, then quote)."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+@mcp.tool()
+def find_category(domain: str, name: str) -> Dict[str, Any]:
+    """
+    Find MODX element category IDs by name (modx_categories).
+
+    Use before create_chunk, which needs a numeric category ID, to locate
+    ContentBlocks tpl categories such as 'Repeater' or 'Overview' on the live site.
+
+    Args:
+        domain: Site domain
+        name:   Category name to search. Exact matches are ranked first, then LIKE matches.
+
+    Returns: {ok, matches: [{id, category, parent}], count}
+    """
+    safe = _sql_escape(name)
+    sql = (
+        "SELECT id, category, parent FROM modx_categories "
+        f"WHERE category='{safe}' OR category LIKE '%{safe}%' "
+        f"ORDER BY (category='{safe}') DESC, id;"
+    )
+    result = mysql_exec(domain, sql)
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("stderr") or result.get("error", "MySQL error")}
+
+    lines = [l for l in result.get("stdout", "").strip().splitlines() if l]
+    matches = []
+    # mysql batch output: first line is the header row (id  category  parent)
+    for line in lines[1:]:
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            matches.append({"id": int(parts[0]), "category": parts[1], "parent": parts[2]})
+
+    return {"ok": True, "name": name, "matches": matches, "count": len(matches)}
+
+
+@mcp.tool()
+def update_chunk(domain: str, name: str, content: str) -> Dict[str, Any]:
+    """
+    Update the content (snippet field) of an existing chunk in MODX
+    (modx_site_htmlsnippets), matched by name.
+
+    Use for DB-stored theme chunks that are deliberately non-static (e.g. the
+    theme 'header' / 'footer'): create_chunk only makes static file-based chunks,
+    so editing a non-static chunk means writing its snippet content in the DB.
+
+    Args:
+        domain:  Site domain
+        name:    Chunk name (e.g. 'header', 'footer')
+        content: New chunk content (raw template). Pass the local .tpl file content.
+
+    Returns: {ok, id, bytes, message} and a warning if the chunk is static.
+    """
+    safe_name = _sql_escape(name)
+
+    check = mysql_exec(domain, f"SELECT id, static FROM modx_site_htmlsnippets WHERE name='{safe_name}';")
+    if not check.get("ok"):
+        return {"ok": False, "error": check.get("stderr") or check.get("error", "MySQL error")}
+
+    rows = [l for l in check.get("stdout", "").strip().splitlines() if l]
+    if len(rows) < 2:
+        return {"ok": False, "error": f"Chunk '{name}' not found"}
+
+    parts = rows[1].split("\t")
+    chunk_id = parts[0]
+    is_static = parts[1] if len(parts) > 1 else "0"
+
+    safe_content = _sql_escape(content)
+    sql = f"UPDATE modx_site_htmlsnippets SET snippet='{safe_content}' WHERE name='{safe_name}';"
+    result = mysql_exec(domain, sql)
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("stderr") or result.get("error", "MySQL error")}
+
+    out = {
+        "ok": True,
+        "name": name,
+        "id": chunk_id,
+        "bytes": len(content),
+        "message": f"Chunk '{name}' content updated",
+    }
+    if is_static == "1":
+        out["warning"] = (
+            "Chunk is static (static=1); the DB snippet is ignored until you also "
+            "overwrite its static_file or set static=0."
+        )
+    return out
 
 
 # ============ ClientConfig tools ============
